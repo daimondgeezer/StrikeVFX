@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Media files (large, not source code)
+*.mp4
+*.mov
+*.avi
+*.wav
+*.flac
+*.aif
+*.aiff
+*.jpg
+*.jpeg
+*.png
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Claude Code
+.claude/
