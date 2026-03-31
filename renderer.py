@@ -181,7 +181,14 @@ class Renderer(QOpenGLWidget):
 
         self.band_energies    = np.zeros(4, np.float32)
         self.band_active      = np.zeros(4, np.float32)
-        self.glitch_intensity = 0.0   # spikes on extreme loudness peaks
+        self.glitch_intensity = 0.0
+
+        # Per-band user controls
+        self.band_max_objects  = [2, 2, 2, 2]        # max simultaneous objects per band
+        self.band_shapes       = [-1, -1, -1, -1]    # -1=random, 0-4=fixed shape index
+        self.band_glitch_amount= [0.0, 0.0, 0.0, 0.0]  # 0-1 glitch contribution per band
+        self.band_muted        = [False, False, False, False]
+
         self._time  = 0.0
         self._frame = 0
         self._rng   = np.random.default_rng(42)
@@ -396,16 +403,16 @@ class Renderer(QOpenGLWidget):
         if waveforms is not None:
             self._waveform_data = waveforms
 
-        # Glitch: spike hard on extreme loudness, decay fast
-        peak = float(energies.max())
-        if peak > 0.82:
-            self.glitch_intensity = min(1.0, self.glitch_intensity + (peak - 0.82) * 5.0)
-        else:
-            self.glitch_intensity = max(0.0, self.glitch_intensity - dt * 4.0)
+        # Per-band glitch: each band contributes when active, scaled by user slider
+        glitch = 0.0
+        for bi in range(4):
+            if not self.band_muted[bi] and self.band_glitch_amount[bi] > 0.01 and active[bi] > 0.01:
+                glitch += self.band_glitch_amount[bi] * float(active[bi])
+        self.glitch_intensity = min(1.0, glitch)
 
         for bi in range(4):
             self._spawn_cd[bi] = max(0.0, self._spawn_cd[bi] - dt)
-            if active[bi] > 0.01 and self._spawn_cd[bi] <= 0.0:
+            if not self.band_muted[bi] and active[bi] > 0.01 and self._spawn_cd[bi] <= 0.0:
                 self._queue_spawn(bi, float(active[bi]), float(energies[bi]))
                 self._spawn_cd[bi] = 0.4
 
@@ -432,6 +439,15 @@ class Renderer(QOpenGLWidget):
         self.spawn_queue_size = len(self._spawn_queue)
         self.update()
 
+    def set_band_shape(self, bi: int, shape_idx: int):
+        """Change a band's shape. Existing objects morph-out (max deform then die quickly)."""
+        if self.band_shapes[bi] != shape_idx:
+            for obj in self.objects:
+                if obj.band_index == bi:
+                    obj.morph_level = 1.0
+                    obj.lifetime = min(obj.lifetime, obj.age + 0.4)
+        self.band_shapes[bi] = shape_idx
+
     def reset(self):
         for obj in self.objects:
             self._dead_queue.append(obj)
@@ -452,8 +468,7 @@ class Renderer(QOpenGLWidget):
 
     def _queue_spawn(self, bi: int, active_val: float, energy: float):
         rng = self._rng
-        # Only spawn if this band has fewer than 2 live objects (keeps it clean)
-        if sum(1 for o in self.objects if o.band_index == bi) >= 2:
+        if sum(1 for o in self.objects if o.band_index == bi) >= self.band_max_objects[bi]:
             return
 
         color = list(self.band_colors[bi])
@@ -468,7 +483,7 @@ class Renderer(QOpenGLWidget):
         life  = float(rng.uniform(1.5, 3.5))
         alpha = float(rng.uniform(0.7, 1.0))
         bias  = [[0,0,2,4],[1,2,2,3],[3,3,4,0],[4,1,2,3]][bi]
-        gtype = int(rng.choice(bias))
+        gtype = self.band_shapes[bi] if self.band_shapes[bi] >= 0 else int(rng.choice(bias))
         is_wire = bool(rng.random() < 0.5)
         self._spawn_queue.append(
             SpawnRequest(gtype, is_wire, pos, rot, scale, color, alpha, spd, life, bi))

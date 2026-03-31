@@ -149,8 +149,12 @@ class ExportStepper(QObject):
 
 # ============================================================= Band Widget
 class BandWidget(QGroupBox):
-    changed       = pyqtSignal()
-    color_changed = pyqtSignal(list)   # emits [r, g, b] floats
+    changed             = pyqtSignal()
+    color_changed       = pyqtSignal(list)   # [r, g, b] floats
+    shape_changed       = pyqtSignal(int)    # -1=random, 0-4=shape index
+    spawn_count_changed = pyqtSignal(int)    # 1-8
+    glitch_changed      = pyqtSignal(float)  # 0.0-1.0
+    mute_changed        = pyqtSignal(bool)
 
     def __init__(self, band_idx: int, config: BandConfig, initial_color: list, parent=None):
         labels = ["Band 1 – Sub/Bass", "Band 2 – Low-Mid",
@@ -247,6 +251,44 @@ class BandWidget(QGroupBox):
         self.color_btn.clicked.connect(self._pick_color)
         grid.addWidget(self.color_btn, 5, 1)
 
+        # Row 6: shape selector + mute button
+        grid.addWidget(lbl("Shape:"), 6, 0)
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItems(["Random", "Cube", "Sphere", "Torus", "Icosahedron", "Tetrahedron"])
+        grid.addWidget(self.shape_combo, 6, 1, 1, 2)
+        self.mute_btn = QPushButton("Mute")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFixedWidth(50)
+        self.mute_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #aaa; }"
+            "QPushButton:checked { background: #aa2200; color: white; font-weight: bold; }")
+        grid.addWidget(self.mute_btn, 6, 3)
+
+        # Row 7: spawn count
+        grid.addWidget(lbl("Objects:"), 7, 0)
+        self.spawn_slider = QSlider(Qt.Horizontal)
+        self.spawn_slider.setRange(1, 8)
+        self.spawn_slider.setValue(2)
+        grid.addWidget(self.spawn_slider, 7, 1, 1, 2)
+        self.spawn_spin = QSpinBox()
+        self.spawn_spin.setRange(1, 8)
+        self.spawn_spin.setValue(2)
+        self.spawn_spin.setFixedWidth(45)
+        grid.addWidget(self.spawn_spin, 7, 3)
+
+        # Row 8: glitch amount
+        grid.addWidget(lbl("Glitch:"), 8, 0)
+        self.glitch_slider = QSlider(Qt.Horizontal)
+        self.glitch_slider.setRange(0, 100)
+        self.glitch_slider.setValue(0)
+        grid.addWidget(self.glitch_slider, 8, 1, 1, 2)
+        self.glitch_spin = QDoubleSpinBox()
+        self.glitch_spin.setRange(0.0, 1.0)
+        self.glitch_spin.setDecimals(2)
+        self.glitch_spin.setSingleStep(0.01)
+        self.glitch_spin.setFixedWidth(60)
+        grid.addWidget(self.glitch_spin, 8, 3)
+
         # --- Connect sliders → spinboxes (bidirectional, guard against loops)
         self._updating = False
 
@@ -300,6 +342,47 @@ class BandWidget(QGroupBox):
         self.gain_spin.valueChanged.connect(gain_spin_changed)
         self.lo.valueChanged.connect(self._on_freq)
         self.hi.valueChanged.connect(self._on_freq)
+
+        # Spawn count — bidirectional
+        def spawn_slider_changed(v):
+            if self._updating: return
+            self._updating = True
+            self.spawn_spin.setValue(v)
+            self._updating = False
+            self.spawn_count_changed.emit(v)
+
+        def spawn_spin_changed(v):
+            if self._updating: return
+            self._updating = True
+            self.spawn_slider.setValue(v)
+            self._updating = False
+            self.spawn_count_changed.emit(v)
+
+        self.spawn_slider.valueChanged.connect(spawn_slider_changed)
+        self.spawn_spin.valueChanged.connect(spawn_spin_changed)
+
+        # Glitch — bidirectional
+        def glitch_slider_changed(v):
+            if self._updating: return
+            self._updating = True
+            self.glitch_spin.setValue(v / 100.0)
+            self._updating = False
+            self.glitch_changed.emit(v / 100.0)
+
+        def glitch_spin_changed(v):
+            if self._updating: return
+            self._updating = True
+            self.glitch_slider.setValue(int(v * 100))
+            self._updating = False
+            self.glitch_changed.emit(v)
+
+        self.glitch_slider.valueChanged.connect(glitch_slider_changed)
+        self.glitch_spin.valueChanged.connect(glitch_spin_changed)
+
+        # Shape + mute
+        self.shape_combo.currentIndexChanged.connect(
+            lambda idx: self.shape_changed.emit(idx - 1))   # 0→-1 (random), 1-5→0-4
+        self.mute_btn.toggled.connect(self.mute_changed)
 
     def _pick_color(self):
         r, g, b = self._color
@@ -420,12 +503,16 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setSpacing(8)
 
-        # Band controls (each has its own colour picker)
+        # Band controls (each has its own colour picker + shape + glitch + mute)
         self.band_widgets = []
         for i, cfg in enumerate(self.analyzer.bands):
             bw = BandWidget(i, cfg, self.renderer.band_colors[i])
             bw.changed.connect(self._on_band_changed)
             bw.color_changed.connect(lambda color, idx=i: self._on_band_color_changed(idx, color))
+            bw.shape_changed.connect(lambda s, idx=i: self.renderer.set_band_shape(idx, s))
+            bw.spawn_count_changed.connect(lambda n, idx=i: self.renderer.band_max_objects.__setitem__(idx, n))
+            bw.glitch_changed.connect(lambda v, idx=i: self.renderer.band_glitch_amount.__setitem__(idx, v))
+            bw.mute_changed.connect(lambda m, idx=i: self.renderer.band_muted.__setitem__(idx, m))
             panel_layout.addWidget(bw)
             self.band_widgets.append(bw)
 
