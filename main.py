@@ -50,12 +50,6 @@ def make_dark_palette(app: QApplication) -> QPalette:
     return p
 
 
-def color_button(r, g, b, parent=None) -> QPushButton:
-    btn = QPushButton(parent)
-    btn.setFixedSize(28, 28)
-    btn.setStyleSheet(f"background-color: rgb({int(r*255)},{int(g*255)},{int(b*255)}); border: 1px solid #555;")
-    return btn
-
 
 # ============================================================= Export stepper
 # Runs entirely on the main thread via a QTimer so GL calls stay legal.
@@ -155,14 +149,16 @@ class ExportStepper(QObject):
 
 # ============================================================= Band Widget
 class BandWidget(QGroupBox):
-    changed = pyqtSignal()
+    changed       = pyqtSignal()
+    color_changed = pyqtSignal(list)   # emits [r, g, b] floats
 
-    def __init__(self, band_idx: int, config: BandConfig, parent=None):
+    def __init__(self, band_idx: int, config: BandConfig, initial_color: list, parent=None):
         labels = ["Band 1 – Sub/Bass", "Band 2 – Low-Mid",
                   "Band 3 – High-Mid", "Band 4 – Highs"]
         super().__init__(labels[band_idx], parent)
         self.band_idx = band_idx
         self.config = config
+        self._color = list(initial_color)
         self._build_ui()
 
     def _build_ui(self):
@@ -241,6 +237,16 @@ class BandWidget(QGroupBox):
         """)
         grid.addWidget(self.meter, 4, 1, 1, 3)
 
+        # Row 5: colour picker
+        grid.addWidget(lbl("Colour:"), 5, 0)
+        r, g, b = self._color
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(40, 22)
+        self.color_btn.setStyleSheet(
+            f"background-color: rgb({int(r*255)},{int(g*255)},{int(b*255)}); border: 1px solid #555;")
+        self.color_btn.clicked.connect(self._pick_color)
+        grid.addWidget(self.color_btn, 5, 1)
+
         # --- Connect sliders → spinboxes (bidirectional, guard against loops)
         self._updating = False
 
@@ -295,6 +301,16 @@ class BandWidget(QGroupBox):
         self.lo.valueChanged.connect(self._on_freq)
         self.hi.valueChanged.connect(self._on_freq)
 
+    def _pick_color(self):
+        r, g, b = self._color
+        initial = QColor(int(r*255), int(g*255), int(b*255))
+        c = QColorDialog.getColor(initial, self, "Pick Band Colour")
+        if c.isValid():
+            self._color = [c.redF(), c.greenF(), c.blueF()]
+            self.color_btn.setStyleSheet(
+                f"background-color: {c.name()}; border: 1px solid #555;")
+            self.color_changed.emit(self._color)
+
     def _on_thresh(self):
         self.config.threshold = self.thresh_spin.value()
         self.changed.emit()
@@ -320,50 +336,6 @@ class BandWidget(QGroupBox):
             QProgressBar::chunk {{ background: {color}; border-radius:3px; }}
         """)
 
-
-# ============================================================= Palette Widget
-class PaletteWidget(QWidget):
-    changed = pyqtSignal(list)   # emits list of (r,g,b) float tuples
-
-    def __init__(self, initial_palette, parent=None):
-        super().__init__(parent)
-        self.colors = list(initial_palette)
-        layout = QHBoxLayout(self)
-        layout.setSpacing(4)
-        layout.setContentsMargins(0,0,0,0)
-        layout.addWidget(QLabel("Palette:"))
-        self.buttons = []
-        for i, c in enumerate(self.colors):
-            btn = color_button(*c, self)
-            btn.clicked.connect(lambda _, idx=i: self._pick(idx))
-            layout.addWidget(btn)
-            self.buttons.append(btn)
-        add_btn = QPushButton("+")
-        add_btn.setFixedSize(28,28)
-        add_btn.clicked.connect(self._add_color)
-        layout.addWidget(add_btn)
-        layout.addStretch()
-
-    def _pick(self, idx):
-        r, g, b = self.colors[idx]
-        initial = QColor(int(r*255), int(g*255), int(b*255))
-        c = QColorDialog.getColor(initial, self, "Pick Color")
-        if c.isValid():
-            self.colors[idx] = (c.redF(), c.greenF(), c.blueF())
-            self.buttons[idx].setStyleSheet(
-                f"background-color: {c.name()}; border: 1px solid #555;")
-            self.changed.emit(self.colors)
-
-    def _add_color(self):
-        c = QColorDialog.getColor(QColor(255,255,255), self, "Add Color")
-        if c.isValid():
-            self.colors.append((c.redF(), c.greenF(), c.blueF()))
-            btn = color_button(c.redF(), c.greenF(), c.blueF(), self)
-            idx = len(self.colors)-1
-            btn.clicked.connect(lambda _, i=idx: self._pick(i))
-            self.layout().insertWidget(self.layout().count()-2, btn)
-            self.buttons.append(btn)
-            self.changed.emit(self.colors)
 
 
 # ============================================================= Main Window
@@ -448,16 +420,12 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setSpacing(8)
 
-        # Palette
-        self.palette_widget = PaletteWidget(self.renderer.palette)
-        self.palette_widget.changed.connect(self._on_palette_changed)
-        panel_layout.addWidget(self.palette_widget)
-
-        # Band controls
+        # Band controls (each has its own colour picker)
         self.band_widgets = []
         for i, cfg in enumerate(self.analyzer.bands):
-            bw = BandWidget(i, cfg)
+            bw = BandWidget(i, cfg, self.renderer.band_colors[i])
             bw.changed.connect(self._on_band_changed)
+            bw.color_changed.connect(lambda color, idx=i: self._on_band_color_changed(idx, color))
             panel_layout.addWidget(bw)
             self.band_widgets.append(bw)
 
@@ -610,8 +578,8 @@ class MainWindow(QMainWindow):
         self.seek_slider.setValue(0)
         self.time_lbl.setText(f"0:00 / {_fmt_time(self.analyzer.duration)}")
 
-    def _on_palette_changed(self, colors):
-        self.renderer.palette = [list(c) for c in colors]
+    def _on_band_color_changed(self, band_idx: int, color: list):
+        self.renderer.band_colors[band_idx] = list(color)
 
     def _on_band_changed(self):
         if self.analyzer.loaded:

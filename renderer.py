@@ -167,9 +167,12 @@ class Renderer(QOpenGLWidget):
         QSurfaceFormat.setDefaultFormat(fmt)
         super().__init__(parent)
 
-        self.palette: List[list] = [
-            [1.0,1.0,1.0],[0.0,0.8,1.0],
-            [1.0,0.2,0.0],[0.2,1.0,0.4],[1.0,0.8,0.0],
+        # One colour per band — user-selectable
+        self.band_colors: List[list] = [
+            [1.0, 1.0, 1.0],   # Band 1 Sub/Bass  – white
+            [0.0, 0.8, 1.0],   # Band 2 Low-Mid   – cyan
+            [1.0, 0.2, 0.0],   # Band 3 High-Mid  – orange/red
+            [0.2, 1.0, 0.4],   # Band 4 Highs     – green
         ]
 
         self.objects:      List[SceneObject]  = []
@@ -404,7 +407,7 @@ class Renderer(QOpenGLWidget):
             self._spawn_cd[bi] = max(0.0, self._spawn_cd[bi] - dt)
             if active[bi] > 0.01 and self._spawn_cd[bi] <= 0.0:
                 self._queue_spawn(bi, float(active[bi]), float(energies[bi]))
-                self._spawn_cd[bi] = 0.05
+                self._spawn_cd[bi] = 0.4
 
         # Age + morph + reap
         keep = []
@@ -423,7 +426,7 @@ class Renderer(QOpenGLWidget):
                 keep.append(obj)
         self.objects = keep
 
-        while len(self.objects) > 100:
+        while len(self.objects) > 16:
             self._dead_queue.append(self.objects.pop(0))
 
         self.spawn_queue_size = len(self._spawn_queue)
@@ -442,26 +445,37 @@ class Renderer(QOpenGLWidget):
         self._waveform_data[:] = 0.0
 
     # -------------------------------------------------------- spawn (no GL)
+    # Each band occupies its own depth layer and scale range.
+    # Band 0 = large, furthest back; Band 3 = smallest, closest front.
+    _BAND_Z     = [-2.2, -0.8,  0.5,  1.8]          # world-Z per band (camera orbits Y)
+    _BAND_SCALE = [(1.4, 2.6), (0.7, 1.4), (0.32, 0.72), (0.10, 0.30)]
+
     def _queue_spawn(self, bi: int, active_val: float, energy: float):
         rng = self._rng
-        color = list(self._rng.choice(self.palette))
-        pos   = [float(rng.uniform(-2.5,2.5)),
-                 float(rng.uniform(-1.5,1.5)),
-                 float(rng.uniform(-2.5,2.5))]
-        scale = float(rng.uniform(0.2, 1.0)) * (1.0 + energy * 0.5)
+        # Only spawn if this band has fewer than 2 live objects (keeps it clean)
+        if sum(1 for o in self.objects if o.band_index == bi) >= 2:
+            return
+
+        color = list(self.band_colors[bi])
+        z     = self._BAND_Z[bi] + float(rng.uniform(-0.2, 0.2))
+        pos   = [float(rng.uniform(-0.35, 0.35)),
+                 float(rng.uniform(-0.25, 0.25)),
+                 z]
+        lo, hi = self._BAND_SCALE[bi]
+        scale = float(rng.uniform(lo, hi)) * (1.0 + energy * 0.25)
         rot   = [float(rng.uniform(0, 6.28)) for _ in range(3)]
-        spd   = [float(rng.uniform(-2.5, 2.5)) for _ in range(3)]
-        life  = float(rng.uniform(0.4, 2.0))
-        alpha = float(rng.uniform(0.65, 1.0))
+        spd   = [float(rng.uniform(-1.5, 1.5)) for _ in range(3)]
+        life  = float(rng.uniform(1.5, 3.5))
+        alpha = float(rng.uniform(0.7, 1.0))
         bias  = [[0,0,2,4],[1,2,2,3],[3,3,4,0],[4,1,2,3]][bi]
         gtype = int(rng.choice(bias))
         is_wire = bool(rng.random() < 0.5)
         self._spawn_queue.append(
             SpawnRequest(gtype, is_wire, pos, rot, scale, color, alpha, spd, life, bi))
         if not is_wire and rng.random() < 0.4:
-            wc = [min(1.0, c+0.3) for c in color]
+            wc = [min(1.0, c + 0.3) for c in color]
             self._spawn_queue.append(
-                SpawnRequest(gtype, True, pos, rot, scale*1.02, wc, 0.7, spd, life, bi))
+                SpawnRequest(gtype, True, pos, rot, scale * 1.02, wc, 0.7, spd, life, bi))
 
     # -------------------------------------------------------- materialise (GL, called from paintGL)
     def _materialise(self, req: SpawnRequest):
