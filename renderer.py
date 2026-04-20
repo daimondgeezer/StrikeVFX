@@ -20,6 +20,7 @@ from OpenGL.GL import shaders
 import geometry as geo
 
 N_WAVE = 128   # waveform ring resolution per band
+_ZERO_WAVE = np.zeros(N_WAVE, np.float32)  # fallback when no waveform data
 
 
 # ============================================================ GLSL
@@ -32,15 +33,24 @@ uniform mat4  uMVP;
 uniform mat4  uModel;
 uniform float uMorph;
 uniform float uTime;
+uniform float uWave[128];
 out vec3 vNorm;
 out vec3 vPos;
 void main(){
     vec3 pos = aPos;
     if(uMorph > 0.001){
-        float d = sin(aPos.x * 8.37 + uTime * 2.13)
-                + sin(aPos.y * 6.18 + uTime * 3.47)
-                + sin(aPos.z * 9.82 + uTime * 1.88);
-        pos += aNorm * (d / 3.0) * uMorph * 0.22;
+        // Map vertex angle (XZ plane, camera orbits Y) to a waveform sample.
+        // 0.15915 = 1/(2*pi), gives a 0..1 range from atan output.
+        float phi = atan(aPos.z, aPos.x) * 0.15915 + 0.5;
+        int   wi  = clamp(int(phi * 128.0), 0, 127);
+        float wave = uWave[wi];   // signed -1..1 audio amplitude
+
+        // Slow sinusoidal shiver keeps wire shapes lively between transients
+        float shiver = sin(aPos.x * 8.37 + uTime * 2.13)
+                     + sin(aPos.y * 6.18 + uTime * 3.47)
+                     + sin(aPos.z * 9.82 + uTime * 1.88);
+
+        pos += aNorm * (wave * 0.7 + shiver * 0.1) * uMorph * 0.55;
     }
     vNorm = mat3(transpose(inverse(uModel))) * aNorm;
     vPos  = vec3(uModel * vec4(pos, 1.0));
@@ -195,6 +205,9 @@ class Renderer(QOpenGLWidget):
         self._spawn_cd = np.zeros(4, np.float32)
 
         self._waveform_data = np.zeros((4, N_WAVE), np.float32)
+        _angles = np.linspace(0, 2*math.pi, N_WAVE, endpoint=False, dtype=np.float32)
+        self._wave_cos = np.cos(_angles)
+        self._wave_sin = np.sin(_angles)
 
         self._prog      = None
         self._wave_prog = None
@@ -251,24 +264,34 @@ class Renderer(QOpenGLWidget):
         self.spawn_queue_size = 0
 
         w, h = self.width(), self.height()
-        use_glitch = self.glitch_intensity > 0.02
+        # Only pay for the FBO round-trip when there are actually objects to glitch.
+        # Rendering to an intermediate FBO costs a full extra pass on every frame;
+        # skip it entirely when the scene is empty.
+        use_glitch = self.glitch_intensity > 0.02 and bool(self.objects)
 
         self._upload_waveforms()
 
         if use_glitch:
-            if self._pfbo is None or w != self._pfbo_w or h != self._pfbo_h:
-                self._build_pfbo(w, h)
+            # Render the scene at half resolution to reduce intermediate FBO cost
+            # (~4× fewer rasterised pixels).  The post shader bilinearly upscales
+            # to fill the screen, which suits the glitch aesthetic.
+            pw, ph = max(1, w // 2), max(1, h // 2)
+            if self._pfbo is None or pw != self._pfbo_w or ph != self._pfbo_h:
+                self._build_pfbo(pw, ph)
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._pfbo)
+            GL.glViewport(0, 0, pw, ph)
         else:
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+            GL.glViewport(0, 0, w, h)
 
-        GL.glViewport(0, 0, w, h)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
 
         if self.objects:
             pv = self._build_pv(w / max(h, 1))
-            self._draw_scene(pv)
-            self._draw_waveforms(pv)
+            # Compute model matrices once per object — reused by both draw passes
+            models = [_model(obj.pos, obj.rot, obj.scale) for obj in self.objects]
+            self._draw_scene(pv, models)
+            self._draw_waveforms(pv, models)
 
         if use_glitch:
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
@@ -286,33 +309,38 @@ class Renderer(QOpenGLWidget):
         )
         return proj @ view
 
-    def _draw_scene(self, pv):
+    def _draw_scene(self, pv, models):
         GL.glUseProgram(self._prog)
-        for obj in self.objects:
-            model = _model(obj.pos, obj.rot, obj.scale)
+        last_band = -1
+        for obj, model in zip(self.objects, models):
             mvp   = pv @ model
             alpha = obj.alpha * _fade(obj)
-            GL.glUniformMatrix4fv(_u(self._prog,'uMVP'),   1, GL.GL_FALSE, mvp.T.astype(np.float32))
-            GL.glUniformMatrix4fv(_u(self._prog,'uModel'), 1, GL.GL_FALSE, model.T.astype(np.float32))
+            # GL_TRUE: OpenGL transposes row-major numpy → column-major, no copy needed
+            GL.glUniformMatrix4fv(_u(self._prog,'uMVP'),   1, GL.GL_TRUE, mvp)
+            GL.glUniformMatrix4fv(_u(self._prog,'uModel'), 1, GL.GL_TRUE, model)
             GL.glUniform3fv(_u(self._prog,'uColor'),  1, obj.color)
             GL.glUniform1f(_u(self._prog,'uAlpha'),   alpha)
             GL.glUniform1i(_u(self._prog,'uWire'),    1 if obj.is_wire else 0)
             GL.glUniform1f(_u(self._prog,'uMorph'),   float(obj.morph_level))
             GL.glUniform1f(_u(self._prog,'uTime'),    self._time)
+            # Only re-upload waveform when band changes — same 4 waveforms repeat
+            if obj.band_index != last_band:
+                wave = self._waveform_data[obj.band_index] if 0 <= obj.band_index < 4 else _ZERO_WAVE
+                GL.glUniform1fv(_u(self._prog,'uWave'), 128, wave)
+                last_band = obj.band_index
             GL.glBindVertexArray(obj.vao)
             GL.glDrawElements(obj.mode, obj.index_count, GL.GL_UNSIGNED_INT, None)
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
 
-    def _draw_waveforms(self, pv):
+    def _draw_waveforms(self, pv, models):
         GL.glUseProgram(self._wave_prog)
-        for obj in self.objects:
+        for obj, model in zip(self.objects, models):
             bi = obj.band_index
             if not (0 <= bi < 4) or self._wave_vaos[bi] is None:
                 continue
-            model = _model(obj.pos, obj.rot, obj.scale)
-            mvp   = pv @ model
-            GL.glUniformMatrix4fv(_u(self._wave_prog,'uMVP'), 1, GL.GL_FALSE, mvp.T.astype(np.float32))
+            mvp = pv @ model
+            GL.glUniformMatrix4fv(_u(self._wave_prog,'uMVP'), 1, GL.GL_TRUE, mvp)
             GL.glUniform3fv(_u(self._wave_prog,'uColor'), 1, obj.color)
             GL.glUniform1f(_u(self._wave_prog,'uAlpha'), obj.alpha * _fade(obj) * 0.75)
             GL.glBindVertexArray(self._wave_vaos[bi])
@@ -336,9 +364,8 @@ class Renderer(QOpenGLWidget):
         GL.glEnable(GL.GL_DEPTH_TEST)
 
     def _upload_waveforms(self):
-        angles = np.linspace(0, 2*math.pi, N_WAVE, endpoint=False, dtype=np.float32)
-        cos_a = np.cos(angles)
-        sin_a = np.sin(angles)
+        cos_a = self._wave_cos
+        sin_a = self._wave_sin
         for bi in range(4):
             if self._wave_vbos[bi] is None:
                 continue
@@ -374,8 +401,9 @@ class Renderer(QOpenGLWidget):
         GL.glViewport(0, 0, w, h)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         pv = self._build_pv(w / h)
-        self._draw_scene(pv)
-        self._draw_waveforms(pv)
+        models = [_model(obj.pos, obj.rot, obj.scale) for obj in self.objects]
+        self._draw_scene(pv, models)
+        self._draw_waveforms(pv, models)
 
         # Post-process → _fbo2
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._fbo2)
@@ -423,10 +451,15 @@ class Renderer(QOpenGLWidget):
             obj.rot += obj.rot_speed * dt
             if 0 <= obj.band_index < 4:
                 e = float(energies[obj.band_index])
-                obj.scale = min(obj.scale * (1.0 + float(active[obj.band_index]) * 0.3 * dt), 4.0)
+                a = float(active[obj.band_index])
+                obj.scale = min(obj.scale * (1.0 + a * 0.3 * dt), 4.0)
                 # Morph tracks band energy: attack fast, release slower
                 target = min(1.0, e * 1.5)
                 obj.morph_level += (target - obj.morph_level) * min(1.0, dt * 8.0)
+                # Band inactive: force a quick fade-out so objects disappear
+                # in sync with the release setting rather than outliving it.
+                if a < 0.05:
+                    obj.lifetime = min(obj.lifetime, obj.age + 0.12)
             if obj.age >= obj.lifetime:
                 self._dead_queue.append(obj)
             else:
@@ -468,7 +501,13 @@ class Renderer(QOpenGLWidget):
 
     def _queue_spawn(self, bi: int, active_val: float, energy: float):
         rng = self._rng
-        if sum(1 for o in self.objects if o.band_index == bi) >= self.band_max_objects[bi]:
+        # Count materialised objects + pending queue entries for this band.
+        # Without the pending check, multiple step() calls between paintGL frames
+        # each pass the limit test and pile up spawns, causing a GL-allocation
+        # spike when paintGL finally drains the queue — the core of the lag loop.
+        existing = sum(1 for o in self.objects if o.band_index == bi)
+        pending  = sum(1 for r in self._spawn_queue if r.band_idx == bi)
+        if existing + pending >= self.band_max_objects[bi]:
             return
 
         color = list(self.band_colors[bi])
@@ -538,6 +577,8 @@ class Renderer(QOpenGLWidget):
         GL.glTexImage2D(GL.GL_TEXTURE_2D,0,GL.GL_RGB,w,h,0,GL.GL_RGB,GL.GL_UNSIGNED_BYTE,None)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MIN_FILTER,GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MAG_FILTER,GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_S,GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_T,GL.GL_CLAMP_TO_EDGE)
         GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER,GL.GL_COLOR_ATTACHMENT0,
                                   GL.GL_TEXTURE_2D,self._fbo_tex,0)
         self._fbo_rbo = GL.glGenRenderbuffers(1)
@@ -556,6 +597,8 @@ class Renderer(QOpenGLWidget):
         GL.glTexImage2D(GL.GL_TEXTURE_2D,0,GL.GL_RGB,w,h,0,GL.GL_RGB,GL.GL_UNSIGNED_BYTE,None)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MIN_FILTER,GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MAG_FILTER,GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_S,GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_T,GL.GL_CLAMP_TO_EDGE)
         GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER,GL.GL_COLOR_ATTACHMENT0,
                                   GL.GL_TEXTURE_2D,self._fbo2_tex,0)
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
@@ -573,6 +616,8 @@ class Renderer(QOpenGLWidget):
         GL.glTexImage2D(GL.GL_TEXTURE_2D,0,GL.GL_RGB,w,h,0,GL.GL_RGB,GL.GL_UNSIGNED_BYTE,None)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MIN_FILTER,GL.GL_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_MAG_FILTER,GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_S,GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D,GL.GL_TEXTURE_WRAP_T,GL.GL_CLAMP_TO_EDGE)
         GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER,GL.GL_COLOR_ATTACHMENT0,
                                   GL.GL_TEXTURE_2D,self._pfbo_tex,0)
         self._pfbo_rbo = GL.glGenRenderbuffers(1)
@@ -610,7 +655,15 @@ class Renderer(QOpenGLWidget):
 
 # ============================================================ GL utils
 
-def _u(prog, name): return GL.glGetUniformLocation(prog, name)
+_uloc_cache: dict = {}
+
+def _u(prog, name):
+    key = (prog, name)
+    loc = _uloc_cache.get(key)
+    if loc is None:
+        loc = GL.glGetUniformLocation(prog, name)
+        _uloc_cache[key] = loc
+    return loc
 
 def _fade(obj):
     if obj.lifetime > 0 and obj.age > obj.lifetime * 0.7:

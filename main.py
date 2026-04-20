@@ -149,7 +149,8 @@ class ExportStepper(QObject):
 
 # ============================================================= Band Widget
 class BandWidget(QGroupBox):
-    changed             = pyqtSignal()
+    envelope_changed    = pyqtSignal()       # threshold/release only — fast rebuild
+    full_changed        = pyqtSignal()       # freq range or gain — full FFT rebuild
     color_changed       = pyqtSignal(list)   # [r, g, b] floats
     shape_changed       = pyqtSignal(int)    # -1=random, 0-4=shape index
     spawn_count_changed = pyqtSignal(int)    # 1-8
@@ -157,12 +158,13 @@ class BandWidget(QGroupBox):
     mute_changed        = pyqtSignal(bool)
 
     def __init__(self, band_idx: int, config: BandConfig, initial_color: list, parent=None):
-        labels = ["Band 1 – Sub/Bass", "Band 2 – Low-Mid",
+        labels = ["Band 1 – Sub/Bass", "Band 2 – Snare/Low-Mid",
                   "Band 3 – High-Mid", "Band 4 – Highs"]
         super().__init__(labels[band_idx], parent)
         self.band_idx = band_idx
         self.config = config
         self._color = list(initial_color)
+        self._meter_active = None   # track last active state to avoid stylesheet thrash
         self._build_ui()
 
     def _build_ui(self):
@@ -217,8 +219,8 @@ class BandWidget(QGroupBox):
         self.release_spin.setFixedWidth(66); self.release_spin.setValue(self.config.release)
         grid.addWidget(self.release_spin, 2, 3)
 
-        # Row 3: gain slider + spinbox
-        grid.addWidget(lbl("Gain:"), 3, 0)
+        # Row 3: gain (visual intensity) slider + spinbox
+        grid.addWidget(lbl("Intensity:"), 3, 0)
         self.gain = QSlider(Qt.Horizontal)
         self.gain.setRange(10, 400)
         self.gain.setValue(int(self.config.gain * 100))
@@ -227,6 +229,7 @@ class BandWidget(QGroupBox):
         self.gain_spin.setRange(0.1, 4.0); self.gain_spin.setDecimals(2)
         self.gain_spin.setSuffix(" ×"); self.gain_spin.setSingleStep(0.05)
         self.gain_spin.setFixedWidth(66); self.gain_spin.setValue(self.config.gain)
+        self.gain_spin.setToolTip("Scales the visual response (object size/morph) without affecting when the band triggers")
         grid.addWidget(self.gain_spin, 3, 3)
 
         # Row 4: level meter
@@ -288,6 +291,7 @@ class BandWidget(QGroupBox):
         self.glitch_spin.setSingleStep(0.01)
         self.glitch_spin.setFixedWidth(60)
         grid.addWidget(self.glitch_spin, 8, 3)
+
 
         # --- Connect sliders → spinboxes (bidirectional, guard against loops)
         self._updating = False
@@ -396,28 +400,31 @@ class BandWidget(QGroupBox):
 
     def _on_thresh(self):
         self.config.threshold = self.thresh_spin.value()
-        self.changed.emit()
+        self.envelope_changed.emit()
 
     def _on_release(self):
         self.config.release = self.release_spin.value()
-        self.changed.emit()
+        self.envelope_changed.emit()
 
     def _on_gain(self):
         self.config.gain = self.gain_spin.value()
-        self.changed.emit()
+        # Gain is applied at read-time in get_frame_data — no rebuild needed
 
     def _on_freq(self):
         self.config.freq_low  = self.lo.value()
         self.config.freq_high = self.hi.value()
-        self.changed.emit()
+        self.full_changed.emit()
 
     def update_meter(self, energy: float, active: float):
         self.meter.setValue(int(energy * 100))
-        color = "#ff4400" if active > 0.01 else "#00b4ff"
-        self.meter.setStyleSheet(f"""
-            QProgressBar {{ background: #222; border: 1px solid #444; border-radius:3px; }}
-            QProgressBar::chunk {{ background: {color}; border-radius:3px; }}
-        """)
+        is_active = active > 0.01
+        if is_active != self._meter_active:
+            self._meter_active = is_active
+            color = "#ff4400" if is_active else "#00b4ff"
+            self.meter.setStyleSheet(f"""
+                QProgressBar {{ background: #222; border: 1px solid #444; border-radius:3px; }}
+                QProgressBar::chunk {{ background: {color}; border-radius:3px; }}
+            """)
 
 
 
@@ -503,11 +510,23 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setSpacing(8)
 
+        # Debounce timers for band config changes
+        self._envelope_timer = QTimer(self)
+        self._envelope_timer.setSingleShot(True)
+        self._envelope_timer.setInterval(250)
+        self._envelope_timer.timeout.connect(self._do_envelope_rebuild)
+
+        self._full_rebuild_timer = QTimer(self)
+        self._full_rebuild_timer.setSingleShot(True)
+        self._full_rebuild_timer.setInterval(400)
+        self._full_rebuild_timer.timeout.connect(self._do_full_rebuild)
+
         # Band controls (each has its own colour picker + shape + glitch + mute)
         self.band_widgets = []
         for i, cfg in enumerate(self.analyzer.bands):
             bw = BandWidget(i, cfg, self.renderer.band_colors[i])
-            bw.changed.connect(self._on_band_changed)
+            bw.envelope_changed.connect(self._on_envelope_changed)
+            bw.full_changed.connect(self._on_full_changed)
             bw.color_changed.connect(lambda color, idx=i: self._on_band_color_changed(idx, color))
             bw.shape_changed.connect(lambda s, idx=i: self.renderer.set_band_shape(idx, s))
             bw.spawn_count_changed.connect(lambda n, idx=i: self.renderer.band_max_objects.__setitem__(idx, n))
@@ -583,7 +602,7 @@ class MainWindow(QMainWindow):
 
     def _tick(self):
         now = time.perf_counter()
-        dt  = now - self._last_wall
+        dt  = min(now - self._last_wall, 1.0 / 20)   # cap at 50ms to prevent runaway
         self._last_wall = now
 
         if self._playing and self.analyzer.loaded:
@@ -668,9 +687,21 @@ class MainWindow(QMainWindow):
     def _on_band_color_changed(self, band_idx: int, color: list):
         self.renderer.band_colors[band_idx] = list(color)
 
-    def _on_band_changed(self):
+    def _on_envelope_changed(self):
+        """Threshold/release changed — debounce a fast envelope-only rebuild."""
+        self._envelope_timer.start()
+
+    def _on_full_changed(self):
+        """Freq range or gain changed — debounce a full FFT rebuild."""
+        self._full_rebuild_timer.start()
+
+    def _do_envelope_rebuild(self):
         if self.analyzer.loaded:
-            self.analyzer.rebuild_envelopes()
+            self.analyzer.rebuild_envelopes_only()
+
+    def _do_full_rebuild(self):
+        if self.analyzer.loaded:
+            self.analyzer.rebuild_full()
 
     def _start_export(self):
         if not self.analyzer.loaded:
